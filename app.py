@@ -2,7 +2,6 @@ import streamlit as st
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import imageio
 import os
 import base64
@@ -15,198 +14,144 @@ st.title("🌊 U-RNN Urban Flood Nowcasting")
 
 
 # ---------------------------------------------------------------------------
-# VISUALIZATION ENGINE
+# ANIMATED GIF
 # ---------------------------------------------------------------------------
+def generate_smooth_flood_gif(rgb_base, predicted_depths):
+    # Guard: ensure uint8 RGB
+    if rgb_base.dtype != np.uint8:
+        rgb_base = np.clip(rgb_base, 0, 255).astype(np.uint8)
 
-def compute_gsd(bbox):
-    """
-    Ground Sampling Distance (metres/pixel) of the 128×128 model output
-    for a given bounding box. Tells you what spatial detail is achievable.
-    """
-    min_lon, min_lat, max_lon, max_lat = bbox
-    # 1 degree latitude ≈ 111,320 m; longitude corrected for lat
-    import math
-    lat_mid  = (min_lat + max_lat) / 2
-    span_m_x = abs(max_lon - min_lon) * 111_320 * math.cos(math.radians(lat_mid))
-    span_m_y = abs(max_lat - min_lat) * 111_320
-    gsd_x = span_m_x / 128
-    gsd_y = span_m_y / 128
-    return gsd_x, gsd_y, span_m_x, span_m_y
+    # Gamma-brighten city layer (lifts shadows without clipping highlights)
+    gamma = 0.75
+    lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
+    rgb_bright = lut[rgb_base]
 
+    # Colormap: fully transparent below vmin
+    cmap = plt.cm.Blues.copy()
+    cmap.set_under(color='none')
 
-def generate_smooth_flood_gif(rgb_base, predicted_depths, gsd_m=55.0):
-    """
-    Renders an animated GIF of the flood simulation overlaid on the city map.
+    H_img, W_img = rgb_bright.shape[:2]
+    extent = [0, W_img, H_img, 0]
 
-    gsd_m : ground sampling distance of the model output in metres/pixel.
-            Used to scale the Gaussian blur kernel — at coarse GSD a large
-            kernel makes blobs even worse; at fine GSD a small kernel preserves
-            genuine street-level spatial detail.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Sanitise the RGB base image
-    # ------------------------------------------------------------------
-    rgb = np.squeeze(rgb_base)  # Drop any singleton dimensions
-
-    # Handle channel-first layout (C, H, W) → (H, W, C)
-    if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4) and rgb.shape[0] < rgb.shape[-1]:
-        rgb = np.transpose(rgb, (1, 2, 0))
-
-    # Ensure 3-channel RGB
-    if rgb.ndim == 2:
-        rgb = np.stack([rgb, rgb, rgb], axis=-1)
-    elif rgb.shape[-1] == 1:
-        rgb = np.concatenate([rgb, rgb, rgb], axis=-1)
-    elif rgb.shape[-1] == 4:
-        rgb = rgb[..., :3]
-
-    # Normalise to uint8 [0, 255]
-    if rgb.dtype != np.uint8:
-        if rgb.max() <= 1.0:
-            rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
-        else:
-            rgb = rgb.clip(0, 255).astype(np.uint8)
-
-    # Gentle contrast boost so the city map pops
-    rgb_bright = cv2.convertScaleAbs(rgb, alpha=1.35, beta=18)
-
-    # ------------------------------------------------------------------
-    # 2. Compute adaptive depth range from actual model output
-    # ------------------------------------------------------------------
-    THRESHOLD = 0.03          # metres — below this = dry land, fully transparent
-    flat = predicted_depths[predicted_depths > THRESHOLD]
-
-    if flat.size > 0:
-        vmax = float(np.percentile(flat, 95))
-        vmax = max(vmax, 0.10)   # at least 10 cm headroom
-        vmax = min(vmax, 5.0)    # cap at 5 m (model's physical max)
+    # --- Dynamic threshold ---
+    # Use 10th percentile of non-zero values as dry cutoff.
+    # If model output is very small (e.g. max=0.3 m), a fixed 0.05 m threshold
+    # would still hide most of the flood. This adapts automatically.
+    nonzero = predicted_depths[predicted_depths > 0]
+    if nonzero.size > 0:
+        DRY_THRESHOLD = max(float(np.percentile(nonzero, 10)), 0.001)
     else:
-        vmax = 0.5               # fallback if model outputs nothing useful
+        DRY_THRESHOLD = 0.001
 
-    norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
-    cmap = plt.cm.Blues
+    # Stable colour scale: 95th percentile across full simulation
+    all_wet = predicted_depths[predicted_depths > DRY_THRESHOLD]
+    if all_wet.size > 0:
+        global_vmax = max(float(np.percentile(all_wet, 95)), DRY_THRESHOLD * 2)
+    else:
+        global_vmax = 1.0
 
-    # ------------------------------------------------------------------
-    # 3. Build figure with a fixed colorbar (drawn once, not per frame)
-    # ------------------------------------------------------------------
-    H_out, W_out = rgb_bright.shape[:2]
-    fig = plt.figure(figsize=(7, 6.5), dpi=150, facecolor='#0a0a0a')
-    ax  = fig.add_axes([0.03, 0.03, 0.82, 0.90])   # main map axes
-    cax = fig.add_axes([0.88, 0.12, 0.025, 0.55])  # colorbar axes
+    print(f"[gif] DRY_THRESHOLD={DRY_THRESHOLD:.4f} m  vmax={global_vmax:.4f} m")
 
-    ax.axis('off')
-    ax.set_facecolor('#0a0a0a')
-
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cb = fig.colorbar(sm, cax=cax)
-    cb.set_label('Water depth (m)', color='#cccccc', fontsize=7, labelpad=6)
-    cb.ax.yaxis.set_tick_params(color='#cccccc', labelsize=6)
-    plt.setp(plt.getp(cb.ax.axes, 'yticklabels'), color='#cccccc')
-    cax.set_facecolor('#0a0a0a')
-
-    # ------------------------------------------------------------------
-    # 4. Frame loop
-    # ------------------------------------------------------------------
+    gif_path = "flood_animation.gif"
     frames = []
-    bg_handle   = None   # imshow handle for the city map
-    over_handle = None   # imshow handle for the flood overlay
+
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=120)
+    fig.patch.set_facecolor('black')
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.98)
 
     for t in range(predicted_depths.shape[0]):
-        depth_128 = predicted_depths[t]  # shape (128, 128)
+        ax.clear()
+        ax.set_facecolor('black')
+        ax.axis('off')
 
-        # --- Upscale AI output to match the city map resolution ---
-        depth_hi = cv2.resize(
-            depth_128, (W_out, H_out), interpolation=cv2.INTER_CUBIC
+        # 1. City base map
+        ax.imshow(rgb_bright, extent=extent, aspect='auto', zorder=1)
+
+        # 2. Upscale 128×128 → 512×512
+        depth_128 = predicted_depths[t]
+        depth_hires = cv2.resize(
+            depth_128, (W_img, H_img), interpolation=cv2.INTER_CUBIC
+        )
+        depth_smooth = cv2.GaussianBlur(depth_hires, (9, 9), 0)
+
+        # 3. Mask dry pixels
+        masked = np.ma.masked_where(depth_smooth <= DRY_THRESHOLD, depth_smooth)
+
+        # 4. Flood overlay
+        ax.imshow(
+            masked,
+            cmap=cmap,
+            vmin=DRY_THRESHOLD + 1e-6,
+            vmax=global_vmax,
+            extent=extent,
+            aspect='auto',
+            interpolation='bilinear',
+            alpha=0.65,
+            zorder=2
         )
 
-        # --- Adaptive blur: scale kernel to actual ground resolution ---
-        # At 55 m/px (7 km bbox) even k=3 spreads 165 m — already too much.
-        # At 16 m/px (2 km bbox) k=5 spreads only 80 m — natural-looking.
-        # We target a physical spread of ~40 m regardless of zoom level.
-        k = max(3, int(round(40.0 / gsd_m)) * 2 + 1)   # must be odd
-        smoothed = cv2.GaussianBlur(depth_hi, (k, k), 0)
-
-        # --- Build RGBA overlay ----------------------------------------
-        # cmap() maps [0,1] → RGBA; we normalise depth then apply alpha.
-        depth_norm = norm(np.clip(smoothed, 0, vmax))       # [0,1]
-        flood_rgba = cmap(depth_norm).astype(np.float32)    # (H, W, 4)
-
-        water_mask = smoothed >= THRESHOLD
-
-        # Alpha: dry → 0 (transparent); wet → scales 0.25→0.75 with depth
-        alpha_layer = np.where(water_mask, 0.25 + 0.50 * depth_norm, 0.0)
-        flood_rgba[..., 3] = alpha_layer.astype(np.float32)
-
-        # --- Draw or update imshow layers (reuse handles = much faster) ---
-        if bg_handle is None:
-            bg_handle   = ax.imshow(rgb_bright,  aspect='auto', interpolation='lanczos')
-            over_handle = ax.imshow(flood_rgba,  aspect='auto', interpolation='bilinear')
-        else:
-            over_handle.set_data(flood_rgba)
-
-        # --- Timestamp ---
-        # Remove previous text artists to avoid stacking
-        for txt in ax.texts:
-            txt.remove()
-
+        # 5. Timestamp
         ax.text(
-            0.02, 0.97,
-            f"T + {t * 10:3d} min",
-            transform=ax.transAxes,
-            color='white', fontsize=10, fontweight='bold', va='top',
-            bbox=dict(facecolor='#0a0a0a', alpha=0.65, edgecolor='none', pad=3)
+            8, 24,
+            f"+{t * 10} min",
+            color='white', fontsize=11, fontweight='bold',
+            bbox=dict(facecolor='#00000099', edgecolor='none', pad=3),
+            zorder=3
         )
 
         fig.canvas.draw()
-        frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
-        frames.append(frame)
+        frames.append(np.asarray(fig.canvas.buffer_rgba())[:, :, :3])
 
     plt.close(fig)
-
-    gif_path = "flood_animation.gif"
-    imageio.mimsave(gif_path, frames, fps=4, loop=0)
+    imageio.mimsave(gif_path, frames, fps=3, loop=0)
     return gif_path
 
 
-# ---------------------------------------------------------------------------
-# STREAMLIT UI
-# ---------------------------------------------------------------------------
+def display_animated_gif(gif_path: str, caption: str = ""):
+    """Embed GIF via base64 HTML — st.image() only shows the first frame."""
+    with open(gif_path, "rb") as f:
+        data = base64.b64encode(f.read()).decode("utf-8")
+    html = f"""
+    <div style="text-align:center; margin-top:8px;">
+        <img src="data:image/gif;base64,{data}"
+             style="width:100%; max-width:700px; border-radius:8px;"
+             alt="{caption}" />
+        <p style="color:#aaa; font-size:13px; margin-top:6px;">{caption}</p>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
+
+def show_diagnostic_heatmap(predicted_depths):
+    """
+    Show a static average-depth heatmap so we can visually confirm the model
+    produced non-zero flood signal before even looking at the animation.
+    """
+    avg_depth = predicted_depths.mean(axis=0)   # (H, W)
+    fig, ax = plt.subplots(figsize=(4, 4))
+    im = ax.imshow(avg_depth, cmap='Blues', interpolation='nearest')
+    ax.set_title("Avg flood depth (model output, metres)", fontsize=9)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.axis('off')
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
 st.sidebar.header("Simulation Settings")
 
-bbox_input  = st.sidebar.text_input(
+bbox_input = st.sidebar.text_input(
     "BBox (Lon Min, Lat Min, Lon Max, Lat Max)",
-    # ~4 km × 3.3 km around central London — ~31 m/px → good block detail without pixelation
-    "-0.14, 51.488, -0.08, 51.518"
+    "-0.20, 51.46, -0.10, 51.52"
 )
 gee_project = st.sidebar.text_input("GEE Project ID")
-intensity   = st.sidebar.slider("Rainfall (mm/hr)", 10.0, 150.0, 50.0)
-time_steps  = st.sidebar.slider("Duration (steps)", 6, 24, 12)
-
-# Live resolution calculator
-try:
-    _bbox = [float(x.strip()) for x in bbox_input.split(',')]
-    _gx, _gy, _sx, _sy = compute_gsd(_bbox)
-    _gsd_avg = (_gx + _gy) / 2
-    if _gsd_avg <= 20:
-        _res_label = "🟢 Street-block detail (~{:.0f} m/px)".format(_gsd_avg)
-    elif _gsd_avg <= 40:
-        _res_label = "🟡 District detail (~{:.0f} m/px)".format(_gsd_avg)
-    else:
-        _res_label = "🔴 City-scale blobs (~{:.0f} m/px) — zoom in for detail".format(_gsd_avg)
-    st.sidebar.caption(
-        f"**Model resolution:** {_gsd_avg:.0f} m/px  \n"
-        f"Area: {_sx/1000:.1f} × {_sy/1000:.1f} km  \n{_res_label}"
-    )
-except Exception:
-    _gsd_avg = 55.0
+intensity   = st.sidebar.slider("Rainfall (mm/hr)",   10.0, 150.0, 50.0)
+time_steps  = st.sidebar.slider("Duration (steps)",   6,    24,    12)
 
 if st.sidebar.button("Run AI Simulation"):
     bbox = [float(x.strip()) for x in bbox_input.split(',')]
-    gsd_x, gsd_y, span_x, span_y = compute_gsd(bbox)
-    gsd_avg = (gsd_x + gsd_y) / 2
 
     with st.spinner("🌍 Fetching 10 m Sentinel-2 data from GEE…"):
         dem, lc, rgb = fetch_regional_data(bbox, project=gee_project.strip())
@@ -216,68 +161,45 @@ if st.sidebar.button("Run AI Simulation"):
             dem, lc, rgb, time_steps, intensity
         )
 
+    # Show city base layer immediately
+    st.subheader("City Base Layer (Sentinel-2)")
+    st.image(rgb_p, caption="10 m Sentinel-2 RGB", use_container_width=True)
+
     with st.spinner("🧠 Running U-RNN inference…"):
         predicted_depths = run_pipeline(dem_p, lc_p, rain_p)
 
-    # ── Post-processing: suppress RNN hidden-state instability artifacts ──
-    # ConvGRU gates saturate outside training distribution, causing:
-    #   EXPLOSION  — update gate over-opens → small input change floods everything
-    #   COLLAPSE   — gate fully closes → output decays to zero despite high rainfall
-    # Suppressed via three conservative steps that don't touch model or pipeline:
+    # --- Diagnostics ---
+    st.subheader("Model Output Diagnostics")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Min depth", f"{predicted_depths.min():.4f} m")
+    col2.metric("Max depth", f"{predicted_depths.max():.4f} m")
+    col3.metric("Mean depth", f"{predicted_depths.mean():.4f} m")
 
-    stabilised = predicted_depths.copy()
+    if predicted_depths.max() < 1e-4:
+        st.error(
+            "⚠️ Model output is essentially zero across all timesteps. "
+            "The weights are likely not loading correctly (check the terminal "
+            "for '[inference] WARNING' messages). The animation will be blank."
+        )
+    else:
+        st.success(f"✅ Flood signal detected — max depth {predicted_depths.max():.3f} m")
 
-    # Step A: per-frame spatial outlier clamp (explosion artifacts sit at 10-100σ)
-    for t in range(stabilised.shape[0]):
-        frame = stabilised[t]
-        if frame.max() > 0:
-            ceiling = frame.mean() + 3.0 * frame.std()
-            stabilised[t] = np.clip(frame, 0.0, ceiling)
+    show_diagnostic_heatmap(predicted_depths)
 
-    # Step B: temporal rolling mean over 3 steps — kills single-frame chaotic spikes
-    from scipy.ndimage import uniform_filter1d
-    stabilised = uniform_filter1d(stabilised, size=3, axis=0, mode='reflect')
+    with st.spinner("🎨 Rendering flood animation…"):
+        gif_path = generate_smooth_flood_gif(rgb_p, predicted_depths)
 
-    # Step C: physical floor / ceiling
-    predicted_depths = np.clip(stabilised, 0.0, 5.0)
-
-    # ── Depth diagnostics (useful for debugging model output) ─────────────
-    min_d  = predicted_depths.min()
-    max_d  = predicted_depths.max()
-    mean_d = predicted_depths.mean()
-    wet_px = (predicted_depths > 0.03).sum()
-    st.info(
-        f"**Model output** — min: `{min_d:.3f} m`  max: `{max_d:.3f} m`  "
-        f"mean: `{mean_d:.3f} m`  wet pixels: `{wet_px}`"
+    display_animated_gif(
+        gif_path,
+        caption=f"Urban Flood Simulation ({time_steps * 10} mins)"
     )
-
-    with st.spinner("🎨 Rendering animation…"):
-        gif_path = generate_smooth_flood_gif(rgb_p, predicted_depths, gsd_m=gsd_avg)
 
     with open(gif_path, "rb") as f:
         gif_bytes = f.read()
 
-    # ── FIX: st.image() does NOT animate GIFs — use HTML instead ──────────
-    gif_b64 = base64.b64encode(gif_bytes).decode("utf-8")
-    st.markdown(
-        f"""
-        <div style="text-align:center;">
-          <img
-            src="data:image/gif;base64,{gif_b64}"
-            style="width:100%; max-width:900px; border-radius:6px;"
-            alt="Flood simulation animation"
-          />
-          <p style="color:#888; font-size:0.85em; margin-top:6px;">
-            Urban flood simulation — {time_steps * 10} min forecast
-          </p>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
     st.download_button(
-        "⬇️ Download animation (.gif)",
+        "⬇️ Download Animation",
         data=gif_bytes,
         file_name="urnn_flood_sim.gif",
-        mime="image/gif",
+        mime="image/gif"
     )
