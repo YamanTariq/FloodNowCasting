@@ -9,6 +9,17 @@ from gee_pipeline import fetch_regional_data
 from dip_engine import prepare_tensors_for_inference
 from inference_hacker import run_pipeline
 
+# ------- NEW IMPORTS for interactive map -------
+import folium
+from folium.plugins import Draw
+
+# fallback if streamlit-folium is not installed
+try:
+    from streamlit_folium import st_folium
+    FOLIUM_AVAILABLE = True
+except ImportError:
+    FOLIUM_AVAILABLE = False
+
 st.set_page_config(page_title="U-RNN Flood Sim", layout="wide")
 st.title("🌊 U-RNN Urban Flood Nowcasting")
 
@@ -34,9 +45,6 @@ def generate_smooth_flood_gif(rgb_base, predicted_depths):
     extent = [0, W_img, H_img, 0]
 
     # --- Dynamic threshold ---
-    # Use 10th percentile of non-zero values as dry cutoff.
-    # If model output is very small (e.g. max=0.3 m), a fixed 0.05 m threshold
-    # would still hide most of the flood. This adapts automatically.
     nonzero = predicted_depths[predicted_depths > 0]
     if nonzero.size > 0:
         DRY_THRESHOLD = max(float(np.percentile(nonzero, 10)), 0.001)
@@ -142,16 +150,68 @@ def show_diagnostic_heatmap(predicted_depths):
 # ---------------------------------------------------------------------------
 st.sidebar.header("Simulation Settings")
 
-bbox_input = st.sidebar.text_input(
-    "BBox (Lon Min, Lat Min, Lon Max, Lat Max)",
-    "-0.20, 51.46, -0.10, 51.52"
-)
+# --- Interactive Map Option (new) ---
+use_map = st.sidebar.checkbox("Use Interactive Map", value=False)
+
+if use_map and FOLIUM_AVAILABLE:
+    st.sidebar.info("Draw a rectangle on the map to define your area of interest.")
+    # Default centre: roughly the middle of the default bbox
+    default_centre = [51.49, -0.15]
+    m = folium.Map(location=default_centre, zoom_start=13)
+
+    Draw(
+        export=True,
+        draw_options={
+            'polyline': False,
+            'polygon': True,
+            'rectangle': True,
+            'circle': False,
+            'marker': False,
+            'circlemarker': False,
+        },
+        edit_options={'edit': False}
+    ).add_to(m)
+
+    # Render map and capture drawn features
+    map_data = st_folium(m, width=700, height=400)
+
+    # Extract bounding box from the last drawn rectangle/polygon
+    if map_data and map_data.get("last_active_drawing"):
+        geom = map_data["last_active_drawing"]["geometry"]
+        coords = geom["coordinates"][0]  # outer ring of polygon/rectangle
+
+        # coords is a list of [lng, lat] pairs
+        lons = [pt[0] for pt in coords]
+        lats = [pt[1] for pt in coords]
+        bbox_from_map = [min(lons), min(lats), max(lons), max(lats)]
+
+        st.sidebar.success(f"Selected area: {bbox_from_map}")
+        st.session_state["bbox"] = bbox_from_map
+    else:
+        st.sidebar.warning("No area drawn yet – default coordinates will be used.")
+        st.session_state["bbox"] = [-0.20, 51.46, -0.10, 51.52]
+
+else:
+    if use_map and not FOLIUM_AVAILABLE:
+        st.sidebar.warning(
+            "Interactive map is not available because `streamlit-folium` "
+            "is not installed. Falling back to manual input."
+        )
+
+    # Fallback to original manual input
+    bbox_input = st.sidebar.text_input(
+        "BBox (Lon Min, Lat Min, Lon Max, Lat Max)",
+        "-0.20, 51.46, -0.10, 51.52"
+    )
+    # Parse the text and store in session state
+    st.session_state["bbox"] = [float(x.strip()) for x in bbox_input.split(',')]
+
 gee_project = st.sidebar.text_input("GEE Project ID")
 intensity   = st.sidebar.slider("Rainfall (mm/hr)",   10.0, 150.0, 50.0)
 time_steps  = st.sidebar.slider("Duration (steps)",   6,    24,    12)
 
 if st.sidebar.button("Run AI Simulation"):
-    bbox = [float(x.strip()) for x in bbox_input.split(',')]
+    bbox = st.session_state.get("bbox", [-0.20, 51.46, -0.10, 51.52])
 
     with st.spinner("🌍 Fetching 10 m Sentinel-2 data from GEE…"):
         dem, lc, rgb = fetch_regional_data(bbox, project=gee_project.strip())
